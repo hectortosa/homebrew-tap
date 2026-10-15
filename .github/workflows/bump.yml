@@ -1,0 +1,171 @@
+name: Bump ThirdPartyDetective
+
+# Run by hand after a ThirdPartyDetective release is published. Verifies the
+# release's macOS and Linux archives against its SHA256SUMS and their build
+# provenance, writes Formula/thirdpartydetective.rb for that version, installs
+# and tests it, and opens a pull request.
+#
+# A pull request opened with GITHUB_TOKEN starts no other workflow, so the tests
+# run here. Opening it needs Settings > Actions > General > "Allow GitHub Actions
+# to create and approve pull requests".
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: ThirdPartyDetective release tag, e.g. v1.0.0
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: hectortosa/ThirdPartyDetective
+
+jobs:
+  formula:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify the release and write the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Not a release tag: $TAG"; exit 1; }
+          VERSION="${TAG#v}"
+          release="$RUNNER_TEMP/release"
+          mkdir -p "$release"
+          gh release download "$TAG" --repo "$SOURCE_REPO" --dir "$release" --pattern SHA256SUMS \
+            --pattern "thirdpartydetective_${VERSION}_osx-*.tar.gz" --pattern "thirdpartydetective_${VERSION}_linux-*.tar.gz"
+          (cd "$release" && sha256sum --check --strict --ignore-missing SHA256SUMS)
+
+          sha() { awk -v f="thirdpartydetective_${VERSION}_$1.tar.gz" '$2 == f { print $1 }' "$release/SHA256SUMS"; }
+          for rid in osx-arm64 osx-x64 linux-arm64 linux-x64; do
+            archive="thirdpartydetective_${VERSION}_${rid}.tar.gz"
+            [[ "$(sha "$rid")" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::$archive is not in SHA256SUMS"; exit 1; }
+            gh attestation verify "$release/$archive" --repo "$SOURCE_REPO" \
+              --signer-workflow "$SOURCE_REPO/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$TAG" --deny-self-hosted-runners
+          done
+
+          base="https://github.com/$SOURCE_REPO/releases/download/$TAG"
+          mkdir -p Formula
+          cat > Formula/thirdpartydetective.rb <<RUBY
+          class Thirdpartydetective < Formula
+            desc "Turns SPDX SBOMs into third-party notices and license reports"
+            homepage "https://github.com/$SOURCE_REPO"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "$base/thirdpartydetective_${VERSION}_osx-arm64.tar.gz"
+                sha256 "$(sha osx-arm64)"
+              end
+              on_intel do
+                url "$base/thirdpartydetective_${VERSION}_osx-x64.tar.gz"
+                sha256 "$(sha osx-x64)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "$base/thirdpartydetective_${VERSION}_linux-arm64.tar.gz"
+                sha256 "$(sha linux-arm64)"
+              end
+              on_intel do
+                url "$base/thirdpartydetective_${VERSION}_linux-x64.tar.gz"
+                sha256 "$(sha linux-x64)"
+              end
+            end
+
+            def install
+              bin.install "thirdpartydetective"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/thirdpartydetective --version")
+            end
+          end
+          RUBY
+          cat Formula/thirdpartydetective.rb
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: formula
+          path: Formula/thirdpartydetective.rb
+          if-no-files-found: error
+
+  test:
+    needs: formula
+    strategy:
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: formula
+          path: Formula
+
+      # Homebrew installs formulae from taps only, so this checkout, with the new
+      # formula committed locally, is tapped.
+      - name: Install and test
+        run: |
+          set -euo pipefail
+          command -v brew >/dev/null || eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          git add Formula/thirdpartydetective.rb
+          git diff --cached --quiet || git -c user.name=ci -c user.email=ci@localhost commit -q -m "test"
+          brew tap hectortosa/tap "$GITHUB_WORKSPACE"
+          brew install hectortosa/tap/thirdpartydetective
+          brew test hectortosa/tap/thirdpartydetective
+          "$(brew --prefix)/bin/thirdpartydetective" --version
+
+  pull-request:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # to push the branch
+      pull-requests: write # to open the pull request
+    steps:
+      # Credentials are kept here only: this job pushes the branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: formula
+          path: Formula
+
+      - name: Open a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          branch="thirdpartydetective-$VERSION"
+          git add Formula/thirdpartydetective.rb
+          if git diff --cached --quiet; then
+            echo "The formula is already at $VERSION."
+            exit 0
+          fi
+          git switch -c "$branch"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "thirdpartydetective $VERSION"
+          git push origin "$branch"
+          gh pr create --base "${GITHUB_REF_NAME}" --head "$branch" --title "thirdpartydetective $VERSION" \
+            --body "Release: https://github.com/$SOURCE_REPO/releases/tag/$TAG. The macOS and Linux archives were checked against SHA256SUMS and their build provenance, and the formula was installed and tested on macOS (Apple silicon, Intel) and Linux x64."

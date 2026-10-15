@@ -1,0 +1,37 @@
+name: Test
+
+# Installs and tests the formula on pull requests and on main. Pull requests
+# from the Bump workflow are tested there instead: a pull request opened with
+# GITHUB_TOKEN starts no workflow.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install and test
+        run: |
+          set -euo pipefail
+          if [ ! -f Formula/thirdpartydetective.rb ]; then
+            echo "No formula yet: run the Bump ThirdPartyDetective workflow after the first release."
+            exit 0
+          fi
+          command -v brew >/dev/null || eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap hectortosa/tap "$GITHUB_WORKSPACE"
+          brew install hectortosa/tap/thirdpartydetective
+          brew test hectortosa/tap/thirdpartydetective
+          "$(brew --prefix)/bin/thirdpartydetective" --version
